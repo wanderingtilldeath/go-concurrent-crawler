@@ -1,16 +1,21 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/net/html"
 )
 
@@ -25,42 +30,76 @@ type Metrics struct {
 	TotalLatency time.Duration
 }
 
+type RobotsRules struct {
+	DisallowPaths []string
+}
+
+type PageResult struct {
+	URL        string
+	StatusCode int
+	Title      string
+	PageSize   int
+	Latency    time.Duration
+}
+
 type Crawler struct {
-	MaxDepth int
-	Workers  int
+	MaxDepth   int
+	Workers    int
+	MaxRetries int
 
-	Visited map[string]bool
+	Visited     map[string]bool
+	RobotsCache map[string]RobotsRules
+
 	Mu      sync.Mutex
-
 	Metrics Metrics
 
 	Jobs chan CrawlJob
 	Wg   sync.WaitGroup
 
 	RateLimiter *time.Ticker
-
-	Client *http.Client
+	Client      *http.Client
+	DB          *pgxpool.Pool
 }
 
 func main() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dbURL := "postgres://postgres:postgres@localhost:5432/crawlerdb?sslmode=disable"
+
+	db, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		fmt.Println("Error connecting to PostgreSQL:", err)
+		return
+	}
+	defer db.Close()
+
+	if err := setupDatabase(ctx, db); err != nil {
+		fmt.Println("Error setting up database:", err)
+		return
+	}
+
 	crawler := &Crawler{
-		MaxDepth: 1,
-		Workers:  5,
-		Visited: make(map[string]bool),
-		Jobs:    make(chan CrawlJob, 100),
+		MaxDepth:   1,
+		Workers:    5,
+		MaxRetries: 3,
+
+		Visited:     make(map[string]bool),
+		RobotsCache: make(map[string]RobotsRules),
+
+		Jobs: make(chan CrawlJob, 100),
 
 		RateLimiter: time.NewTicker(200 * time.Millisecond),
 
 		Client: &http.Client{
 			Timeout: 15 * time.Second,
 		},
+
+		DB: db,
 	}
 	defer crawler.RateLimiter.Stop()
 
 	startURL := "https://go.dev"
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	go listenForShutdown(cancel)
 
@@ -68,6 +107,23 @@ func main() {
 
 	fmt.Println("Crawl finished")
 	crawler.printStats()
+}
+
+func setupDatabase(ctx context.Context, db *pgxpool.Pool) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS crawled_pages (
+		id BIGSERIAL PRIMARY KEY,
+		url TEXT NOT NULL UNIQUE,
+		status_code INTEGER NOT NULL,
+		title TEXT,
+		page_size INTEGER NOT NULL,
+		latency_ms INTEGER NOT NULL,
+		crawled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	`
+
+	_, err := db.Exec(ctx, query)
+	return err
 }
 
 func listenForShutdown(cancel context.CancelFunc) {
@@ -135,33 +191,23 @@ func (c *Crawler) crawl(ctx context.Context, job CrawlJob, workerID int) {
 		return
 	}
 
-	select {
-	case <-ctx.Done():
-		fmt.Println("Crawl cancelled before fetching:", job.URL)
-		return
-	case <-c.RateLimiter.C:
-	}
-
-	fmt.Println("Worker", workerID, "crawling:", job.URL)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, job.URL, nil)
+	allowed, err := c.isAllowedByRobots(ctx, job.URL)
 	if err != nil {
-		fmt.Println("Error creating request:", err)
-		c.recordFailure()
+		fmt.Println("Could not check robots.txt, continuing:", err)
+	} else if !allowed {
+		fmt.Println("Blocked by robots.txt, skipping:", job.URL)
 		return
 	}
 
-	startTime := time.Now()
+	fmt.Println("Worker", workerID, "preparing to crawl:", job.URL)
 
-	resp, err := c.Client.Do(req)
+	resp, latency, err := c.fetchWithRetry(ctx, job.URL)
 	if err != nil {
-		fmt.Println("Error fetching page:", err)
+		fmt.Println("Final fetch failure:", err)
 		c.recordFailure()
 		return
 	}
 	defer resp.Body.Close()
-
-	latency := time.Since(startTime)
 
 	if resp.StatusCode != http.StatusOK {
 		fmt.Println("Skipping page. Status code:", resp.StatusCode)
@@ -169,9 +215,29 @@ func (c *Crawler) crawl(ctx context.Context, job CrawlJob, workerID int) {
 		return
 	}
 
-	c.recordSuccess(latency)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Println("Error reading page body:", err)
+		c.recordFailure()
+		return
+	}
 
-	links := extractLinks(resp, job.URL)
+	title := extractTitle(bytes.NewReader(body))
+	links := extractLinks(bytes.NewReader(body), job.URL)
+
+	result := PageResult{
+		URL:        job.URL,
+		StatusCode: resp.StatusCode,
+		Title:      title,
+		PageSize:   len(body),
+		Latency:    latency,
+	}
+
+	if err := c.savePageResult(ctx, result); err != nil {
+		fmt.Println("Error saving page result:", err)
+	}
+
+	c.recordSuccess(latency)
 
 	fmt.Println("Found", len(links), "links on", job.URL)
 
@@ -202,6 +268,202 @@ func (c *Crawler) crawl(ctx context.Context, job CrawlJob, workerID int) {
 			}
 		}
 	}
+}
+
+func (c *Crawler) savePageResult(ctx context.Context, result PageResult) error {
+	query := `
+	INSERT INTO crawled_pages (
+		url,
+		status_code,
+		title,
+		page_size,
+		latency_ms
+	)
+	VALUES ($1, $2, $3, $4, $5)
+	ON CONFLICT (url) DO UPDATE SET
+		status_code = EXCLUDED.status_code,
+		title = EXCLUDED.title,
+		page_size = EXCLUDED.page_size,
+		latency_ms = EXCLUDED.latency_ms,
+		crawled_at = NOW();
+	`
+
+	_, err := c.DB.Exec(
+		ctx,
+		query,
+		result.URL,
+		result.StatusCode,
+		result.Title,
+		result.PageSize,
+		int(result.Latency.Milliseconds()),
+	)
+
+	return err
+}
+
+func (c *Crawler) isAllowedByRobots(ctx context.Context, pageURL string) (bool, error) {
+	parsedURL, err := url.Parse(pageURL)
+	if err != nil {
+		return false, err
+	}
+
+	domain := parsedURL.Scheme + "://" + parsedURL.Host
+
+	rules, err := c.getRobotsRules(ctx, domain)
+	if err != nil {
+		return true, err
+	}
+
+	for _, disallowPath := range rules.DisallowPaths {
+		if disallowPath == "" {
+			continue
+		}
+
+		if strings.HasPrefix(parsedURL.Path, disallowPath) {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+func (c *Crawler) getRobotsRules(ctx context.Context, domain string) (RobotsRules, error) {
+	c.Mu.Lock()
+	rules, exists := c.RobotsCache[domain]
+	c.Mu.Unlock()
+
+	if exists {
+		return rules, nil
+	}
+
+	robotsURL := domain + "/robots.txt"
+
+	fmt.Println("Fetching robots.txt:", robotsURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, robotsURL, nil)
+	if err != nil {
+		return RobotsRules{}, err
+	}
+
+	resp, err := c.Client.Do(req)
+	if err != nil {
+		return RobotsRules{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		emptyRules := RobotsRules{}
+
+		c.Mu.Lock()
+		c.RobotsCache[domain] = emptyRules
+		c.Mu.Unlock()
+
+		return emptyRules, nil
+	}
+
+	parsedRules := parseRobotsTxt(resp)
+
+	c.Mu.Lock()
+	c.RobotsCache[domain] = parsedRules
+	c.Mu.Unlock()
+
+	return parsedRules, nil
+}
+
+func parseRobotsTxt(resp *http.Response) RobotsRules {
+	var rules RobotsRules
+
+	scanner := bufio.NewScanner(resp.Body)
+
+	appliesToAllCrawlers := false
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		lowerLine := strings.ToLower(line)
+
+		if strings.HasPrefix(lowerLine, "user-agent:") {
+			userAgent := strings.TrimSpace(line[len("user-agent:"):])
+			appliesToAllCrawlers = userAgent == "*"
+			continue
+		}
+
+		if appliesToAllCrawlers && strings.HasPrefix(lowerLine, "disallow:") {
+			disallowPath := strings.TrimSpace(line[len("disallow:"):])
+			rules.DisallowPaths = append(rules.DisallowPaths, disallowPath)
+		}
+	}
+
+	return rules
+}
+
+func (c *Crawler) fetchWithRetry(ctx context.Context, pageURL string) (*http.Response, time.Duration, error) {
+	var lastErr error
+	var lastLatency time.Duration
+
+	for attempt := 1; attempt <= c.MaxRetries+1; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, lastLatency, ctx.Err()
+		case <-c.RateLimiter.C:
+		}
+
+		fmt.Println("Fetching:", pageURL, "attempt:", attempt)
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
+		if err != nil {
+			return nil, lastLatency, err
+		}
+
+		startTime := time.Now()
+
+		resp, err := c.Client.Do(req)
+
+		lastLatency = time.Since(startTime)
+
+		if err == nil && !shouldRetryStatus(resp.StatusCode) {
+			return resp, lastLatency, nil
+		}
+
+		if err == nil {
+			lastErr = fmt.Errorf("received retryable status code: %d", resp.StatusCode)
+			resp.Body.Close()
+		} else {
+			lastErr = err
+		}
+
+		if attempt <= c.MaxRetries {
+			backoff := calculateBackoff(attempt)
+
+			fmt.Println("Retrying after:", backoff)
+
+			select {
+			case <-ctx.Done():
+				return nil, lastLatency, ctx.Err()
+			case <-time.After(backoff):
+			}
+		}
+	}
+
+	return nil, lastLatency, lastErr
+}
+
+func shouldRetryStatus(statusCode int) bool {
+	return statusCode == http.StatusTooManyRequests ||
+		statusCode == http.StatusInternalServerError ||
+		statusCode == http.StatusBadGateway ||
+		statusCode == http.StatusServiceUnavailable ||
+		statusCode == http.StatusGatewayTimeout
+}
+
+func calculateBackoff(attempt int) time.Duration {
+	baseDelay := 500 * time.Millisecond
+
+	return baseDelay * time.Duration(1<<(attempt-1))
 }
 
 func (c *Crawler) markVisited(pageURL string) bool {
@@ -247,10 +509,10 @@ func (c *Crawler) printStats() {
 	}
 }
 
-func extractLinks(resp *http.Response, baseURL string) []string {
+func extractLinks(reader io.Reader, baseURL string) []string {
 	var links []string
 
-	doc, err := html.Parse(resp.Body)
+	doc, err := html.Parse(reader)
 	if err != nil {
 		fmt.Println("Error parsing HTML:", err)
 		return links
@@ -278,6 +540,38 @@ func extractLinks(resp *http.Response, baseURL string) []string {
 	visitNode(doc)
 
 	return links
+}
+
+func extractTitle(reader io.Reader) string {
+	doc, err := html.Parse(reader)
+	if err != nil {
+		return ""
+	}
+
+	var title string
+
+	var visitNode func(*html.Node)
+
+	visitNode = func(n *html.Node) {
+		if title != "" {
+			return
+		}
+
+		if n.Type == html.ElementNode && n.Data == "title" {
+			if n.FirstChild != nil {
+				title = strings.TrimSpace(n.FirstChild.Data)
+			}
+			return
+		}
+
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			visitNode(child)
+		}
+	}
+
+	visitNode(doc)
+
+	return title
 }
 
 func normalizeURL(link string, baseURL string) (string, bool) {
