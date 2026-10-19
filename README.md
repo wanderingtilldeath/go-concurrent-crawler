@@ -1,56 +1,48 @@
-# go-concurrent-crawler
+# CrawlerX
 
-A small, concurrent, depth-bounded web crawler written in Go. It starts from
-one seed URL, fetches pages with a fixed pool of worker goroutines, follows
-links up to a configurable depth, and reports basic crawl metrics — all with
-graceful shutdown on `Ctrl+C`.
+A resumable, polite web crawler in Go. Work lives in Postgres (a lease-based queue using `FOR UPDATE SKIP LOCKED`), per-host politeness is shared through Redis, and any number of processes can crawl together. Kill one with `kill -9` and the rest (or a restart) finish its work without re-crawling pages that were already done.
 
-It's intentionally minimal: no database, no distributed queue, no external
-frameworks beyond the standard library and `golang.org/x/net/html`. The point
-is to be a clean, well-tested example of Go's concurrency primitives used for
-a real (if small) purpose. See [`docs/CONCEPTS.md`](docs/CONCEPTS.md) for a
-detailed walkthrough of every concept and pattern used here, aimed at
-developers new to Go and preparing for SDE interviews.
+**Only crawl your own site, or sites that allow it.** The API has no authentication and `POST /crawls` makes the server fetch URLs: keep it on a private network.
 
-## Project layout
+## Quick start
 
-```
-cmd/crawler/            entrypoint: flags, logger, signal handling, wiring
-internal/crawler/        worker pool, job queue, dedup, metrics, orchestration
-internal/fetcher/         HTTP fetch, behind an interface for testability
-internal/linkextractor/   HTML parsing -> absolute links, behind an interface
-docs/CONCEPTS.md          concept & system design deep-dive
+```sh
+make up                                   # postgres, redis, fakesite, 2 crawlers (needs Docker)
+curl -XPOST localhost:8081/crawls -d '{"seed":"http://fakesite:9000/","max_depth":6}'
+curl localhost:8081/crawls/1              # counts by status, "done": true when finished
+curl 'localhost:8081/search?q=nebula'
+open http://localhost:8081                # dashboard: status breakdown, throughput, depth chart, search
+curl localhost:8081/metrics
 ```
 
-`internal/` packages are not importable outside this module — that's enforced
-by the Go compiler, not just convention.
+Without Docker, run Postgres and Redis yourself:
 
-## Running it
-
-```bash
-go run ./cmd/crawler -url=https://go.dev -max-depth=1 -workers=5
+```sh
+export DATABASE_URL=postgres://... REDIS_URL=redis://...
+go run ./cmd/fakesite -pages 500 &
+go run ./cmd/crawlerx -seed http://127.0.0.1:9000/ -max-depth 6 -exit-when-done
 ```
 
-Flags (all optional):
+To **resume** after a crash, restart `crawlerx` *without* `-seed`: it works whatever is pending. (`-seed` starts a new crawl.)
 
-| Flag           | Default            | Meaning                                   |
-|----------------|--------------------|--------------------------------------------|
-| `-url`         | `https://go.dev`   | Seed URL to start crawling from            |
-| `-max-depth`   | `1`                | Max link hops to follow from the seed      |
-| `-workers`     | `5`                | Number of concurrent crawl workers         |
-| `-rate-limit`  | `200ms`            | Minimum interval between requests          |
-| `-timeout`     | `15s`              | Per-request HTTP timeout                   |
+## How it works
 
-Press `Ctrl+C` to stop early; the crawler shuts down gracefully and still
-prints the metrics gathered so far.
+| piece | what it does |
+|---|---|
+| `internal/frontier` | queue + visited set in one table; claim with `SKIP LOCKED`; expired leases are re-claimed (crash recovery); shallowest-first so the depth limit means "within N hops" |
+| `internal/politeness` | Redis Lua gate: one slot per host per delay, shared by all processes; a denied worker reschedules the URL instead of sleeping |
+| `internal/robots` | RFC 9309 via `temoto/robotstxt`: Allow/Disallow, wildcards, Crawl-delay; 4xx = allow, 5xx = disallow; cached in Redis |
+| `internal/fetch` | size cap (2 MiB), HTML only, honest User-Agent, no inline redirects (a redirect target is queued like any link), `Retry-After`, full-jitter backoff |
+| `internal/parse`, `internal/urlnorm` | one parse per page; `<base href>`, meta robots; URL canonicalisation with a fuzz test |
+| `internal/store` | batched page writes, `tsvector` + GIN full-text search, ETag/Last-Modified |
 
-## Building and testing
+Config is flags with env fallbacks: see `go run ./cmd/crawlerx -h`.
 
-```bash
-go build ./...
-go vet ./...
-go test ./... -race -v
+## Tests
+
+```sh
+go test -short ./...                      # no services needed
+make test                                 # all tests, -race, needs TEST_DATABASE_URL and TEST_REDIS_URL
 ```
 
-Tests run against in-process `httptest` servers (no real network calls), so
-they're fast and deterministic.
+The suite includes the original deadlock regression (`internal/crawler/deadlock_test.go`) and end-to-end `kill -9` / SIGTERM / two-process tests (`internal/e2e`). Benchmark: `make bench`, results and caveats in [docs/BENCHMARK.md](docs/BENCHMARK.md). Concept notes: [docs/CONCEPTS.md](docs/CONCEPTS.md).
